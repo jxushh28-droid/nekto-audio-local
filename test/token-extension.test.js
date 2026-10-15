@@ -50,16 +50,20 @@ test('token init script ignores Google, CAPTCHA frames, lookalike hosts and othe
   }
 });
 
-test('Windows uses visible installed Chrome; Railway and displayless Linux use bundled headless Chromium', () => {
-  const local = browserLaunchOptions('fixture.wav', { env: {}, platform: 'win32' });
-  assert.equal(local.channel, 'chrome'); assert.equal(local.headless, false);
-  assert(!local.args.includes('--no-sandbox'));
-  for (const env of [{ RAILWAY_PROJECT_ID: 'fixture' }, {}]) {
-    const server = browserLaunchOptions('fixture.wav', { env, platform: 'linux' });
-    assert.equal(server.channel, 'chromium'); assert.equal(server.headless, true);
+test('local build always launches a visible, headful real Chrome window', () => {
+  const win = browserLaunchOptions('fixture.wav', { env: {}, platform: 'win32' });
+  assert.equal(win.channel, 'chrome'); assert.equal(win.headless, false);
+  assert(!win.args.includes('--no-sandbox'));
+  assert(!win.args.includes('--headless=new'));
+  // Stays headful regardless of platform or env — no headless path in this repo.
+  for (const env of [{ RAILWAY_PROJECT_ID: 'fixture' }, { NEKTO_HEADLESS: '1' }, {}]) {
+    const any = browserLaunchOptions('fixture.wav', { env, platform: 'linux' });
+    assert.equal(any.headless, false);
+    assert(!any.args.includes('--headless=new'));
   }
-  const explicit = browserLaunchOptions('fixture.wav', { env: { NEKTO_HEADLESS: '0', NEKTO_BROWSER_CHANNEL: 'chrome' }, platform: 'linux' });
-  assert.equal(explicit.channel, 'chrome'); assert.equal(explicit.headless, false);
+  // The channel can still be forced to bundled Chromium as a fallback.
+  const chrom = browserLaunchOptions('fixture.wav', { env: { NEKTO_BROWSER_CHANNEL: 'chromium' }, platform: 'win32' });
+  assert.equal(chrom.channel, 'chromium'); assert.equal(chrom.headless, false);
 });
 
 test('generated extension matches the uploaded manifest and updates tokens in private files', async () => {
