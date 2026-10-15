@@ -7,23 +7,36 @@ import {
   NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
 } from '@discordjs/voice';
 import { NektoBrowser } from './nekto.js';
-import { PcmQueue, RelayOpusStream } from './pcm.js';
+import { MixQueue, RelayOpusStream } from './pcm.js';
 import { TokenStore } from './token-store.js';
-import { statusReply } from './status-reply.js';
 import { commands } from './commands.js';
 import { RelaySettings, changeAutoNext } from './relay-settings.js';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
-const store = new TokenStore(process.env.DATA_DIR || './data', process.env.NEKTO_AUTH_TOKEN || '');
-const settings = new RelaySettings(process.env.DATA_DIR || './data');
+const DATA_DIR = process.env.DATA_DIR || './data';
+const store1 = new TokenStore(DATA_DIR, process.env.NEKTO_AUTH_TOKEN || '', 'nekto-token1.json');
+const store2 = new TokenStore(DATA_DIR, process.env.NEKTO_AUTH_TOKEN2 || '', 'nekto-token2.json');
+const settings = new RelaySettings(DATA_DIR);
 let ready = false;
 let busy = false;
 let closing = false;
 let browserLaunchError = null;
 let session = null;
 let ownerIds = new Set();
-const queue = new PcmQueue();
-const browser = new NektoBrowser(base64 => { if (session) queue.accept(base64); });
+const queue = new MixQueue();
+// Two bridged nekto windows. Each stranger's captured voice is mixed into
+// Discord (so the user hears both) AND injected as the OTHER window's
+// microphone (so the two strangers hear and talk to each other). The user's
+// own Discord mic is never forwarded, so the strangers never hear the user.
+const browserA = new NektoBrowser(b64 => { if (session) { queue.accept1(b64); browserB.injectMic(b64); } }, DATA_DIR, { label: '1', injectMic: true });
+const browserB = new NektoBrowser(b64 => { if (session) { queue.accept2(b64); browserA.injectMic(b64); } }, DATA_DIR, { label: '2', injectMic: true });
+const browsers = [browserA, browserB];
+async function stopBrowsers() { await Promise.all(browsers.map(b => b.stop().catch(() => {}))); }
+async function searchBoth() {
+  const a = await browserA.search(store1.value).catch(e => `error: ${safeError(e)}`);
+  const b = await browserB.search(store2.value).catch(e => `error: ${safeError(e)}`);
+  return `Window 1 — ${a} || Window 2 — ${b}`;
+}
 const startupCategory = error => {
   const message = String(error?.message || '');
   if (/ProcessSingleton|SingletonLock|profile appears to be in use|profile.*locked/i.test(message)) return 'browser-profile-locked';
@@ -42,11 +55,11 @@ async function leave() {
     previous.stream.destroy();
     if (previous.connection.state.status !== VoiceConnectionStatus.Destroyed) previous.connection.destroy();
   }
-  await browser.stop();
+  await stopBrowsers();
 }
 
 async function join(interaction) {
-  if (!store.value) throw new Error('Set your Nekto token with /token first.');
+  if (!store1.value || !store2.value) throw new Error('Set both tokens first: /token1 and /token2.');
   const member = await interaction.guild.members.fetch(interaction.user.id);
   const channel = member.voice.channel;
   if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Join a regular Discord voice channel first.');
@@ -57,7 +70,7 @@ async function join(interaction) {
   if (session?.guildId === interaction.guildId && session.channelId === channel.id &&
       session.userId === interaction.user.id && session.connection.state.status === VoiceConnectionStatus.Ready &&
       session.player.state.status === AudioPlayerStatus.Playing) {
-    return browser.search(store.value);
+    return searchBoth();
   }
   await leave();
   const connection = joinVoiceChannel({
@@ -92,7 +105,7 @@ async function join(interaction) {
     throw new Error('Could not establish Discord voice. Check Connect/Speak permissions and try /join again.');
   }
   // Keep Discord voice connected if the website search fails.
-  return browser.search(store.value);
+  return searchBoth();
 }
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -114,49 +127,62 @@ client.on(Events.InteractionCreate, async interaction => {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     let message, privateStatus;
     switch (interaction.commandName) {
-      case 'token': {
+      case 'token1': case 'token2': {
+        const n = interaction.commandName === 'token1' ? 1 : 2;
+        const store = n === 1 ? store1 : store2;
+        const br = n === 1 ? browserA : browserB;
         await store.set(interaction.options.getString('token', true));
-        await browser.stop(); queue.clear();
-        message = 'Nekto token saved. Use /join to start, or /next if I am already in your voice channel.';
+        await br.stop(); queue.clear();
+        message = `Window ${n} token saved. Use /join to open both windows once both tokens are set.`;
         if (session?.guildId === interaction.guildId) {
           const member = await interaction.guild.members.fetch(interaction.user.id);
-          if (member.voice.channelId === session?.channelId) message = `Nekto token saved. ${await browser.search(store.value)}`;
+          if (member.voice.channelId === session?.channelId) message = `Window ${n} token saved. ${await br.search(store.value)}`;
         }
         break;
       }
       case 'join': message = await join(interaction); break;
-      case 'autonext': message = await changeAutoNext(browser, settings, interaction.options.getBoolean('enabled')); break;
+      case 'autonext': {
+        const val = interaction.options.getBoolean('enabled');
+        message = await changeAutoNext(browserA, settings, val);
+        browserB.setAutoNext(browserA.autoNext);
+        break;
+      }
       case 'next': {
         if (!session || session.guildId !== interaction.guildId) throw new Error('Use /join first.');
         const member = await interaction.guild.members.fetch(interaction.user.id);
         if (member.voice.channelId !== session.channelId) throw new Error('Join my voice channel first.');
         console.log(JSON.stringify({ event: 'nekto_next_requested', source: 'discord-command' }));
-        queue.clear(); message = await browser.next(store.value); break;
+        queue.clear();
+        const a = await browserA.next(store1.value).catch(e => `error: ${safeError(e)}`);
+        const b = await browserB.next(store2.value).catch(e => `error: ${safeError(e)}`);
+        message = `Window 1 — ${a} || Window 2 — ${b}`;
+        break;
       }
       case 'proxy': {
         const raw = interaction.options.getString('url') || '';
-        const server = browser.setProxy(raw);
+        const server = browserA.setProxy(raw); browserB.setProxy(raw);
         await settings.setProxy(raw);
-        // Restart the browser so the new proxy takes effect (it is a launch/context-
-        // level setting), then re-search if we were in a voice channel.
-        await browser.stop(); queue.clear();
-        if (server) {
-          message = `Proxy set to ${server}. ` + (session?.guildId === interaction.guildId
-            ? `Reconnecting… ${await browser.search(store.value)}` : 'Use /join to start through it.');
-        } else {
-          message = 'Proxy cleared — using your direct connection. ' + (session?.guildId === interaction.guildId
-            ? `Reconnecting… ${await browser.search(store.value)}` : 'Use /join to start.');
-        }
+        // Restart both browsers so the new proxy takes effect, then re-search if
+        // we were already in a voice channel.
+        await stopBrowsers(); queue.clear();
+        const tail = session?.guildId === interaction.guildId ? `Reconnecting… ${await searchBoth()}` : 'Use /join to start through it.';
+        message = (server ? `Proxy set to ${server}. ` : 'Proxy cleared — using your direct connection. ') + tail;
         break;
       }
-      case 'stop': await browser.stop(); queue.clear(); message = 'Nekto stopped.'; break;
-      case 'leave': await leave(); message = 'Stopped Nekto and left voice.'; break;
+      case 'stop': await stopBrowsers(); queue.clear(); message = 'Both windows stopped.'; break;
+      case 'leave': await leave(); message = 'Stopped both windows and left voice.'; break;
       case 'status': {
-        const status = await browser.status(store.value);
-        console.log(JSON.stringify({ event: 'discord_audio_status', voice: session?.connection.state.status || 'disconnected',
+        const [sa, sb] = await Promise.all([browserA.status(store1.value), browserB.status(store2.value)]);
+        const voice = session?.connection.state.status || 'disconnected';
+        console.log(JSON.stringify({ event: 'discord_audio_status', voice,
           framesReceived: queue.received, nonSilentFrames: queue.nonSilent,
           bufferedFrames: queue.frames.length, droppedFrames: queue.dropped, bufferUnderruns: queue.underruns }));
-        privateStatus = statusReply({ status, voice: session?.connection.state.status || 'disconnected', token: store.value, queue });
+        const line = (n, s) => `Window ${n}: ${s.active ? (s.callState?.phase || 'open') : 'stopped'}` +
+          `; auth=${s.authorization || 'unconfirmed'}; captcha=${!!(s.authorizationDiagnostics?.captcha || s.authorizationDiagnostics?.hcaptcha)}` +
+          `; restricted=${!!s.authorizationDiagnostics?.restricted}; lastFail=${s.lastFailure ? s.lastFailure.code : 'none'}`;
+        message = `Discord voice: ${voice}\n${line(1, sa)}\n${line(2, sb)}\n` +
+          `Audio (mixed): frames=${queue.received}, with-sound=${queue.nonSilent}\n` +
+          `Live view + captcha solving for both windows: http://localhost:${PANEL_PORT}`;
         break;
       }
     }
@@ -196,14 +222,23 @@ h1{font-size:18px;font-weight:600;color:#fff;margin-bottom:16px;letter-spacing:.
 #err{display:none;background:#2d0f0f;border:1px solid #f87171;border-radius:6px;padding:10px;margin-bottom:12px;color:#f87171;font-size:12px}
 .ts{font-size:10px;color:#333;margin-top:14px;text-align:right}
 </style></head><body>
-<h1>nekto-audio <span id="ts">—</span></h1>
+<h1>nekto-audio <span style="font-size:11px;font-weight:400;color:#888">two-window bridge</span> <span id="ts">—</span></h1>
 <div id="err"></div>
 <div class="grid" id="grid"></div>
-<div style="margin-top:16px">
-  <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:8px">Browser view <span id="livestate" style="color:#4ade80;font-weight:400">● live — click to interact, type to send keys</span></div>
-  <div id="shotwrap" tabindex="0" style="position:relative;width:100%;max-width:1100px;aspect-ratio:1920/985;background:#0a0a0c;border-radius:6px;border:1px solid #222;outline:none;overflow:hidden;cursor:crosshair">
-    <img id="shot" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:none" alt="">
-    <div id="shotmsg" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#666;font-size:13px;text-align:center;padding:20px">Waiting for an active browser session — use /join to start.</div>
+<div style="margin-top:16px;display:flex;gap:14px;flex-wrap:wrap">
+  <div style="flex:1 1 440px;min-width:340px">
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:8px">Window 1 — stranger A <span id="livestate1" style="color:#4ade80;font-weight:400">● click to interact</span></div>
+    <div id="shotwrap1" data-w="1" tabindex="0" style="position:relative;width:100%;aspect-ratio:1920/985;background:#0a0a0c;border-radius:6px;border:1px solid #222;outline:none;overflow:hidden;cursor:crosshair">
+      <img id="shot1" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:none" alt="">
+      <div id="shotmsg1" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#666;font-size:13px;text-align:center;padding:20px">Window 1 — use /join to start.</div>
+    </div>
+  </div>
+  <div style="flex:1 1 440px;min-width:340px">
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#555;margin-bottom:8px">Window 2 — stranger B <span id="livestate2" style="color:#4ade80;font-weight:400">● click to interact</span></div>
+    <div id="shotwrap2" data-w="2" tabindex="0" style="position:relative;width:100%;aspect-ratio:1920/985;background:#0a0a0c;border-radius:6px;border:1px solid #222;outline:none;overflow:hidden;cursor:crosshair">
+      <img id="shot2" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:none" alt="">
+      <div id="shotmsg2" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#666;font-size:13px;text-align:center;padding:20px">Window 2 — use /join to start.</div>
+    </div>
   </div>
 </div>
 <script>
@@ -285,62 +320,72 @@ function render(d){
       row('Browser audio',d.audioState||'—',d.audioState==='running'?'ok':'warn'),
     ].join('')),
   ];
+  const w2=d.w2||{};
+  cards.splice(1,0,card('Window 2 (stranger B)',[
+    row('Nekto',w2.nekto||'stopped',(w2.nekto&&w2.nekto!=='stopped')?'ok':'dim'),
+    row('Authorization',w2.authorization||'unconfirmed',(w2.authorization||'').includes('confirm')?'ok':'warn'),
+    row('Captcha',w2.captcha?badge('REQUIRED','bad'):badge('clear','ok')),
+    row('Restricted',w2.restricted?badge('YES','bad'):badge('no','ok')),
+    row('Browser IP',w2.browserIp||'unknown',w2.browserIp?'ok':'dim'),
+    row('Last failure',w2.lastFailure?badge(w2.lastFailure,'bad'):badge('none','ok')),
+  ].join('')));
   document.getElementById('grid').innerHTML=cards.join('');
 }
-const shot=document.getElementById('shot');
-const shotwrap=document.getElementById('shotwrap');
-const shotmsg=document.getElementById('shotmsg');
-let shotBusy=false;
-function refreshShot(){
-  if(shotBusy)return;shotBusy=true;
-  const img=new Image();
-  img.onload=()=>{shot.src=img.src;shot.style.display='block';shotmsg.style.display='none';shotBusy=false;};
-  img.onerror=()=>{
-    shot.style.display='none';shotmsg.style.display='flex';shotBusy=false;
-    const d=window.__lastStatus||{};
-    if(d.browserLaunchError){shotmsg.textContent='Browser failed to start on the server: '+d.browserLaunchError+'. Use /join to retry.';}
-    else if(d.nekto&&d.nekto!=='stopped'){shotmsg.textContent='Session active ('+d.nekto+') — waiting for a frame. If this stays empty, the bot in your VC may be a different instance than this panel.';}
-    else{shotmsg.textContent='No active browser session. In Discord: /join your voice channel (that opens the nekto page), then this view goes live. Already joined and still blank? You may be running the bot twice on the same token — only one instance has the page.';}
-  };
-  img.src='/screenshot?t='+Date.now();
-}
-// Map a click on the displayed image to page (viewport) coordinates. The image is
-// object-fit:contain inside the wrapper, so compute the real drawn rect.
-function pageCoords(e){
-  const r=shotwrap.getBoundingClientRect();
-  const nw=shot.naturalWidth||1920, nh=shot.naturalHeight||985;
-  const scale=Math.min(r.width/nw, r.height/nh);
-  const dw=nw*scale, dh=nh*scale;
-  const ox=(r.width-dw)/2, oy=(r.height-dh)/2;
-  const x=Math.round((e.clientX-r.left-ox)/scale);
-  const y=Math.round((e.clientY-r.top-oy)/scale);
-  return {x:Math.max(0,Math.min(nw,x)), y:Math.max(0,Math.min(nh,y))};
-}
-const live=document.getElementById('livestate');
-function sendInput(params){
-  const q=new URLSearchParams(params);
-  return fetch('/input?'+q.toString())
-    .then(r=>r.json()).then(d=>{
-      if(live)live.textContent=d.ok?('● sent '+params.type+(params.x!=null?' @'+params.x+','+params.y:'')):'● input failed (no active page)';
-      setTimeout(refreshShot,150);setTimeout(refreshShot,500);
-      return d.ok;
+// One interactive live view per window. w is '1' or '2'; screenshots and input
+// are routed to the matching browser via ?w=.
+function setupView(w){
+  const shot=document.getElementById('shot'+w);
+  const wrap=document.getElementById('shotwrap'+w);
+  const msg=document.getElementById('shotmsg'+w);
+  const live=document.getElementById('livestate'+w);
+  let busy=false;
+  function refresh(){
+    if(busy)return;busy=true;
+    const img=new Image();
+    img.onload=()=>{shot.src=img.src;shot.style.display='block';msg.style.display='none';busy=false;};
+    img.onerror=()=>{
+      shot.style.display='none';msg.style.display='flex';busy=false;
+      const d=window.__lastStatus||{};
+      const st=w==='1'?d:(d.w2||{});
+      if(w==='1'&&d.browserLaunchError){msg.textContent='Browser failed to start: '+d.browserLaunchError+'. Use /join to retry.';}
+      else if(st.nekto&&st.nekto!=='stopped'){msg.textContent='Window '+w+' active ('+st.nekto+') — waiting for a frame…';}
+      else{msg.textContent='Window '+w+' — set /token'+w+' and /join to start.';}
+    };
+    img.src='/screenshot?w='+w+'&t='+Date.now();
+  }
+  function coords(e){
+    const r=wrap.getBoundingClientRect();
+    const nw=shot.naturalWidth||1920,nh=shot.naturalHeight||985;
+    const scale=Math.min(r.width/nw,r.height/nh);
+    const dw=nw*scale,dh=nh*scale,ox=(r.width-dw)/2,oy=(r.height-dh)/2;
+    const x=Math.round((e.clientX-r.left-ox)/scale),y=Math.round((e.clientY-r.top-oy)/scale);
+    return {x:Math.max(0,Math.min(nw,x)),y:Math.max(0,Math.min(nh,y))};
+  }
+  function send(params){
+    const q=new URLSearchParams(Object.assign({w},params));
+    return fetch('/input?'+q.toString()).then(r=>r.json()).then(d=>{
+      if(live)live.textContent=d.ok?('● sent '+params.type):'● input failed (no page)';
+      setTimeout(refresh,150);setTimeout(refresh,500);return d.ok;
     }).catch(()=>{if(live)live.textContent='● input error';});
+  }
+  function flash(e){
+    const d=document.createElement('div');
+    d.style.cssText='position:fixed;left:'+(e.clientX-8)+'px;top:'+(e.clientY-8)+'px;width:16px;height:16px;border:2px solid #4ade80;border-radius:50%;pointer-events:none;z-index:9999;transition:all .4s;opacity:1';
+    document.body.appendChild(d);requestAnimationFrame(()=>{d.style.transform='scale(2)';d.style.opacity='0';});
+    setTimeout(()=>d.remove(),450);
+  }
+  wrap.addEventListener('click',e=>{flash(e);const{x,y}=coords(e);send({type:'click',x,y});wrap.focus();});
+  wrap.addEventListener('wheel',e=>{e.preventDefault();send({type:'scroll',dy:Math.round(e.deltaY)});},{passive:false});
+  wrap.addEventListener('keydown',e=>{
+    const named=['Enter','Backspace','Tab','Escape','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Delete','Home','End'];
+    if(named.includes(e.key)){e.preventDefault();send({type:'key',key:e.key});}
+    else if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();send({type:'text',text:e.key});}
+  });
+  return refresh;
 }
-function flash(e){
-  const r=shot.getBoundingClientRect();
-  const d=document.createElement('div');
-  d.style.cssText='position:fixed;left:'+(e.clientX-8)+'px;top:'+(e.clientY-8)+'px;width:16px;height:16px;border:2px solid #4ade80;border-radius:50%;pointer-events:none;z-index:9999;transition:all .4s;opacity:1';
-  document.body.appendChild(d);requestAnimationFrame(()=>{d.style.transform='scale(2)';d.style.opacity='0';});
-  setTimeout(()=>d.remove(),450);
-}
-shotwrap.addEventListener('click',e=>{flash(e);const{x,y}=pageCoords(e);sendInput({type:'click',x,y});shotwrap.focus();});
-shotwrap.addEventListener('wheel',e=>{e.preventDefault();sendInput({type:'scroll',dy:Math.round(e.deltaY)});},{passive:false});
-shotwrap.addEventListener('keydown',e=>{
-  const named=['Enter','Backspace','Tab','Escape','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Delete','Home','End'];
-  if(named.includes(e.key)){e.preventDefault();sendInput({type:'key',key:e.key});}
-  else if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();sendInput({type:'text',text:e.key});}
-});
-poll();setInterval(poll,1500);setInterval(refreshShot,700);
+const refresh1=setupView('1'),refresh2=setupView('2');
+poll();setInterval(poll,1500);
+setInterval(()=>{refresh1();refresh2();},700);
 </script></body></html>`;
 
 const server = http.createServer(async (request, response) => {
@@ -353,13 +398,18 @@ const server = http.createServer(async (request, response) => {
     response.end(JSON.stringify({ ready: ready && client.isReady() }));
     return;
   }
+  const pickBrowser = () => {
+    const w = new URL(request.url, 'http://x').searchParams.get('w');
+    return w === '2' ? browserB : browserA;
+  };
   if (pathname === '/status') {
     try {
-      const status = await browser.status(store.value);
+      const [status, statusB] = await Promise.all([browserA.status(store1.value), browserB.status(store2.value)]);
       const d = status.authorizationDiagnostics || {};
       const p = status.protocolDiagnostics || {};
       const c = status.controlDiagnostics || {};
       const obs = status.observedStage ? { stage: `${status.observedStage}; captcha=${!!d.captcha}; hcaptcha=${!!d.hcaptcha}` } : {};
+      const db = statusB.authorizationDiagnostics || {};
       response.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       response.end(JSON.stringify({
         voice: session?.connection.state.status || 'disconnected',
@@ -384,6 +434,14 @@ const server = http.createServer(async (request, response) => {
         controls: c,
         observed: obs,
         microphone: status.microphone || null,
+        w2: {
+          nekto: statusB.active ? (statusB.callState?.phase || 'open') : 'stopped',
+          browserIp: statusB.browserIp || null,
+          authorization: statusB.authorization || 'unconfirmed',
+          captcha: !!(db.captcha || db.hcaptcha),
+          restricted: !!db.restricted,
+          lastFailure: statusB.lastFailure ? `${statusB.lastFailure.code}: ${statusB.lastFailure.message}` : null,
+        },
       }));
     } catch {
       response.writeHead(503, { 'Content-Type': 'application/json' });
@@ -393,7 +451,7 @@ const server = http.createServer(async (request, response) => {
   }
   if (pathname === '/screenshot') {
     try {
-      const img = await browser.screenshot();
+      const img = await pickBrowser().screenshot();
       if (!img) { response.writeHead(503); response.end('no page'); return; }
       response.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' });
       response.end(img);
@@ -409,7 +467,7 @@ const server = http.createServer(async (request, response) => {
       if (q.get('dy') != null) ev.dy = Number(q.get('dy'));
       if (q.get('text') != null) ev.text = q.get('text');
       if (q.get('key') != null) ev.key = q.get('key');
-      const ok = await browser.input(ev);
+      const ok = await pickBrowser().input(ev);
       response.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       response.end(JSON.stringify({ ok }));
     } catch { response.writeHead(400); response.end('bad input'); }
@@ -447,7 +505,7 @@ async function shutdown() {
   if (closing) return;
   closing = true; ready = false;
   const force = setTimeout(() => process.exit(1), 10000); force.unref();
-  await leave(); await browser.close(); client.destroy(); server.close();
+  await leave(); await Promise.all(browsers.map(b => b.close().catch(() => {}))); client.destroy(); server.close();
   clearTimeout(force);
 }
 process.on('SIGTERM', () => void shutdown());
@@ -457,20 +515,13 @@ let startupStage = 'configuration';
 try {
   if (!process.env.DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required.');
   startupStage = 'token-store';
-  await store.load();
+  await store1.load(); await store2.load();
   startupStage = 'relay-settings';
-  browser.setAutoNext(await settings.load());
-  if (settings.proxy) browser.setProxy(settings.proxy);
-  startupStage = 'browser';
-  // Warm the browser process, but don't let a launch failure take down the HTTP
-  // panel: the server is already listening, and a dead localhost:3000 hides the
-  // real error. On failure, record it and keep serving — /join retries the launch.
-  try {
-    await browser.launch(store.value);
-  } catch (error) {
-    browserLaunchError = safeError(error);
-    console.error(JSON.stringify({ event: 'browser_launch_failed_nonfatal', stage: 'browser', errorType: browserLaunchError }));
-  }
+  const auto = await settings.load();
+  browserA.setAutoNext(auto); browserB.setAutoNext(auto);
+  if (settings.proxy) { browserA.setProxy(settings.proxy); browserB.setProxy(settings.proxy); }
+  // Both nekto windows launch on /join (fresh extension profiles), so there is
+  // no eager browser warm-up here — nothing to open before the user asks.
   client.once(Events.ClientReady, async () => {
     try {
       await client.application.fetch();

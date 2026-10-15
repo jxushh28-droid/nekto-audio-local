@@ -2,9 +2,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export class TokenStore {
-  constructor(directory, fallback = '') {
+  constructor(directory, fallback = '', filename = 'nekto-token.json') {
     this.directory = directory;
-    this.path = join(directory, 'nekto-token.json');
+    this.path = join(directory, filename);
     this.value = fallback;
   }
   async load() {

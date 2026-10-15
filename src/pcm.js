@@ -45,6 +45,36 @@ export class PcmQueue {
   clear() { this.frames.length = 0; this.primed = false; }
 }
 
+// Sum two 20 ms PCM frames sample-by-sample with clamping, so the user hears
+// both strangers at once (not one after the other).
+function mixFrames(a, b) {
+  const out = Buffer.allocUnsafe(FRAME_BYTES);
+  for (let i = 0; i < FRAME_BYTES; i += 2) {
+    let s = a.readInt16LE(i) + b.readInt16LE(i);
+    if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+    out.writeInt16LE(s, i);
+  }
+  return out;
+}
+
+// Two independent inbound PcmQueues (stranger A, stranger B) mixed into one
+// real-time stream for Discord. Each 20 ms pull sums one frame from each side.
+export class MixQueue {
+  constructor(maxFrames = 12, opts = {}) {
+    this.q1 = new PcmQueue(maxFrames, opts);
+    this.q2 = new PcmQueue(maxFrames, opts);
+  }
+  accept1(base64) { return this.q1.accept(base64); }
+  accept2(base64) { return this.q2.accept(base64); }
+  next() { return mixFrames(this.q1.next(), this.q2.next()); }
+  clear() { this.q1.clear(); this.q2.clear(); }
+  get received() { return this.q1.received + this.q2.received; }
+  get nonSilent() { return this.q1.nonSilent + this.q2.nonSilent; }
+  get dropped() { return this.q1.dropped + this.q2.dropped; }
+  get underruns() { return this.q1.underruns + this.q2.underruns; }
+  get frames() { return { length: this.q1.frames.length + this.q2.frames.length }; }
+}
+
 export class RelayOpusStream extends Readable {
   constructor(queue, { bitrate = 64000 } = {}) {
     // Discord reads one packet each 20 ms. Avoid a second drifting timer and
