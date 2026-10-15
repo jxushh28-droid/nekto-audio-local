@@ -1,5 +1,7 @@
 import { chromium } from 'playwright';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { installBrowserRelay, inspectBrowserMicrophone } from './browser-init.js';
 import { searchError } from './search-error.js';
 import { audioClientReady, confirmAudioToken, authorizationError } from './live-session.js';
@@ -7,7 +9,7 @@ import { readAudioCallState, waitForAudioSearch } from './call-state.js';
 import { readAudioPrompt } from './audio-prompt.js';
 import { advanceAudioCall } from './call-controls.js';
 import { observeAudioSession } from './session-observation.js';
-import { tokenExtensionScript, browserLaunchOptions } from './token-extension.js';
+import { tokenExtensionScript, browserLaunchOptions, writeTokenExtension } from './token-extension.js';
 import { windowsUserAgentOverride } from './windows-spoof.js';
 import { installWebglSpoof, DEFAULT_GL_RENDERER, DEFAULT_GL_VENDOR } from './webgl-spoof.js';
 import { waitForStartControl, inspectStartControls } from './start-controls.js';
@@ -45,6 +47,45 @@ export class NektoBrowser {
     this.canvasHash = null;
     this.audioHash = null;
     this.envProbe = null;
+    // Load the token as a real unpacked MV3 extension (matching the manual
+    // browser setup) in a throwaway profile, rather than injecting via init
+    // script into a plain incognito context. Default ON for this local build;
+    // set NEKTO_USE_EXTENSION=0 to fall back to the init-script path.
+    this.useExtension = process.env.NEKTO_USE_EXTENSION !== '0';
+    this.ephemeral = null; // { userDataDir, extDir } temp dirs for the current session
+  }
+
+  // Launch a throwaway persistent profile with the nekto-prime extension loaded.
+  // A persistent context is required because Chrome refuses --load-extension in a
+  // pure incognito context; a fresh temp profile deleted after use gives the same
+  // clean-slate (no cookie/history carryover) as incognito. The extension writes
+  // storage_audio_v2.user.authToken at document_start, exactly like the manual
+  // browser extension. Returns the context (it is also the thing to close).
+  async cleanupEphemeral(dirs) {
+    if (!dirs) return;
+    for (const d of [dirs.userDataDir, dirs.extDir]) {
+      if (d) await rm(d, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  async launchExtensionContext(token) {
+    const base = browserLaunchOptions(this.microphonePath);
+    const extDir = await mkdtemp(join(tmpdir(), 'nekto-ext-'));
+    await writeTokenExtension(extDir, token);
+    const userDataDir = await mkdtemp(join(tmpdir(), 'nekto-prof-'));
+    const previousEphemeral = this.ephemeral;
+    this.ephemeral = { userDataDir, extDir };
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      channel: base.channel,
+      headless: false,
+      viewport: null,
+      ignoreDefaultArgs: base.ignoreDefaultArgs,
+      args: [`--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, ...base.args],
+      ...(this.proxy ? { proxy: this.proxy } : {}),
+    });
+    // The previous session's temp profile can be removed now that a new one is up.
+    await this.cleanupEphemeral(previousEphemeral);
+    console.log(JSON.stringify({ event: 'nekto_extension_loaded', extDir }));
+    return context;
   }
 
   // Set/clear the outbound proxy. Takes a raw string ("socks5://ip:port",
@@ -193,9 +234,15 @@ export class NektoBrowser {
       // Use the native UA, Client Hints, GPU, plugins, audio and screen.
       // Chromium supplies the correct Origin on the actual .kz page; global
       // extra headers would also alter Google/CAPTCHA and other-site requests.
-      const browser = await this.launch(token);
+      if (this.useExtension) {
+        // Real extension + throwaway profile (incognito-equivalent clean slate).
+        context = await this.launchExtensionContext(token);
+      } else {
+        const browser = await this.launch(token);
+        check();
+        context = await browser.newContext({ viewport: null, ...(this.proxy ? { proxy: this.proxy } : {}) });
+      }
       check();
-      context = await browser.newContext({ viewport: null, ...(this.proxy ? { proxy: this.proxy } : {}) });
       if (this.proxy) console.log(JSON.stringify({ event: 'nekto_proxy_active', server: this.proxy.server }));
       // Grant notifications too: headless defaults Notification.permission to
       // 'denied', which nekto reads (notificationPermission/permissionsState) as a
@@ -663,6 +710,9 @@ export class NektoBrowser {
     this.page = null; this.context = null;
     // Keep this.browser alive — it's reused across sessions (newContext() per session).
     if (context) await context.close().catch(() => {});
+    // Remove the throwaway extension profile so nothing persists between sessions.
+    const dirs = this.ephemeral; this.ephemeral = null;
+    await this.cleanupEphemeral(dirs);
   }
   async close() {
     await this.stop();
