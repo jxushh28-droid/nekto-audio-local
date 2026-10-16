@@ -188,9 +188,12 @@ client.on(Events.InteractionCreate, async interaction => {
     }
     await interaction.editReply(privateStatus || { content: message, allowedMentions: { parse: [] } });
   } catch (error) {
-    console.error(`Relay command /${interaction.commandName} failed (${safeError(error)}).`);
-    const publicMessages = /^(Set your Nekto|Join a regular|Give the bot|Nekto |Remote audio|Audio capture|Could not establish|Could not read|Token must|Use \/join|Join my voice|Join the voice)/;
-    const message = publicMessages.test(error.message) ? error.message : 'The relay operation failed. Check Railway runtime logs for the error category, then try again.';
+    // Full message + stack to the local console (not to Discord) so failures are
+    // diagnosable; safeError stays for the structured category.
+    console.error(`Relay command /${interaction.commandName} failed (${safeError(error)}): ${error?.message || error}`);
+    if (error?.stack) console.error(error.stack);
+    const publicMessages = /^(Set your Nekto|Set both tokens|Join a regular|Give the bot|Nekto |Remote audio|Audio capture|Could not establish|Could not read|Token must|Use \/join|Join my voice|Join the voice)/;
+    const message = publicMessages.test(error.message) ? error.message : `The relay operation failed: ${String(error?.message || 'unknown error').slice(0, 300)}`;
     if (interaction.deferred) await interaction.editReply({ content: message }).catch(() => {});
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
   } finally { busy = false; }

@@ -69,6 +69,9 @@ export class NektoBrowser {
     }
   }
   async launchExtensionContext(token) {
+    // Chrome's --use-file-for-fake-audio-capture arg points at this file, so it
+    // must exist before launch even though getUserMedia is overridden.
+    await writeSilentMicrophone(this.microphonePath);
     const base = browserLaunchOptions(this.microphonePath);
     const extDir = await mkdtemp(join(tmpdir(), 'nekto-ext-'));
     await writeTokenExtension(extDir, token);
