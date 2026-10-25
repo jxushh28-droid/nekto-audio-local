@@ -3,9 +3,10 @@ import {
   ChannelType, Client, Events, GatewayIntentBits, MessageFlags, PermissionFlagsBits,
 } from 'discord.js';
 import {
-  AudioPlayerStatus, createAudioPlayer, createAudioResource, entersState, joinVoiceChannel,
-  NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
+  AudioPlayerStatus, createAudioPlayer, createAudioResource, entersState, EndBehaviorType,
+  joinVoiceChannel, NoSubscriberBehavior, StreamType, VoiceConnectionStatus,
 } from '@discordjs/voice';
+import OpusScript from 'opusscript';
 import { NektoBrowser } from './nekto.js';
 import { PcmQueue, RelayOpusStream } from './pcm.js';
 import { TokenStore } from './token-store.js';
@@ -23,7 +24,27 @@ let browserLaunchError = null;
 let session = null;
 let ownerIds = new Set();
 const queue = new PcmQueue();
-const browser = new NektoBrowser(base64 => { if (session) queue.accept(base64); });
+// injectMic: true so the stranger hears the user — the user's Discord voice is
+// decoded and pushed into nekto's outgoing mic (window.__injectMic).
+const browser = new NektoBrowser(base64 => { if (session) queue.accept(base64); }, process.env.DATA_DIR || './data', { injectMic: true });
+// One Opus decoder for the user's inbound Discord voice (48 kHz stereo, 20 ms).
+const micDecoder = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
+// Pipe one speaking user's Discord audio into nekto's mic. Subscribed per
+// speaking-start; Discord only sends packets while the user actually talks.
+function bridgeUserMicrophone(connection, current) {
+  const active = new Set();
+  connection.receiver.speaking.on('start', userId => {
+    if (session !== current || userId !== current.userId || active.has(userId)) return;
+    active.add(userId);
+    const opus = connection.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 400 } });
+    opus.on('data', packet => {
+      if (session !== current) return;
+      try { browser.injectMic(micDecoder.decode(packet).toString('base64')); } catch (_) {}
+    });
+    opus.on('end', () => active.delete(userId));
+    opus.on('error', () => active.delete(userId));
+  });
+}
 const startupCategory = error => {
   const message = String(error?.message || '');
   if (/ProcessSingleton|SingletonLock|profile appears to be in use|profile.*locked/i.test(message)) return 'browser-profile-locked';
@@ -62,7 +83,8 @@ async function join(interaction) {
   await leave();
   const connection = joinVoiceChannel({
     channelId: channel.id, guildId: interaction.guild.id,
-    adapterCreator: interaction.guild.voiceAdapterCreator, selfDeaf: true, selfMute: false,
+    // selfDeaf:false so the bot receives the user's voice to forward to nekto.
+    adapterCreator: interaction.guild.voiceAdapterCreator, selfDeaf: false, selfMute: false,
   });
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
   const stream = new RelayOpusStream(queue, { bitrate: channel.bitrate || 64000 });
@@ -86,6 +108,7 @@ async function join(interaction) {
     connection.subscribe(player);
     player.play(createAudioResource(stream, { inputType: StreamType.Opus }));
     await entersState(player, AudioPlayerStatus.Playing, 5000);
+    bridgeUserMicrophone(connection, current); // forward the user's voice into nekto's mic
   } catch (error) {
     await leave();
     if (/Set your|Join the|Nekto|capture/i.test(error.message)) throw error;
@@ -111,7 +134,15 @@ client.on(Events.InteractionCreate, async interaction => {
   }
   busy = true;
   try {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // Discord gives 3s to acknowledge. Under audio-relay load the event loop can
+    // miss that window; if the defer fails the interaction is already dead, so
+    // bail cleanly instead of throwing a stack for every later editReply.
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } catch (ackError) {
+      console.warn(`/${interaction.commandName}: could not acknowledge in time (${safeError(ackError)}); run it again.`);
+      return;
+    }
     let message, privateStatus;
     switch (interaction.commandName) {
       case 'token': {

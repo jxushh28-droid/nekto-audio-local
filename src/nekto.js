@@ -25,7 +25,8 @@ import { updateProtocolSummary } from './protocol-diagnostics.js';
 export const NEKTO_URL = 'https://nekto-me.kz/audiochat#/';
 
 export class NektoBrowser {
-  constructor(onAudio, directory = process.env.DATA_DIR || './data') {
+  constructor(onAudio, directory = process.env.DATA_DIR || './data', { injectMic = false } = {}) {
+    this.injectMicEnabled = injectMic;
     this.onAudio = onAudio; this.page = null; this.browser = null; this.context = null;
     this.generation = 0; this.lastFailure = null; this.authorizationDiagnostics = null; this.callState = null; this.promptInfo = null; this.microphone = null;
     this.forwarding = false;
@@ -317,7 +318,7 @@ export class NektoBrowser {
       // rtc.track_integrity / rtcTrackReplacementDetected monitor, so this tests
       // whether that prototype tampering is what triggers the restriction.
       if (process.env.NEKTO_NO_RELAY !== '1') {
-        await page.addInitScript(installBrowserRelay, { origin: new URL(NEKTO_URL).origin });
+        await page.addInitScript(installBrowserRelay, { origin: new URL(NEKTO_URL).origin, injectMic: this.injectMicEnabled });
       } else {
         // Minimal stub so status/monitor reads don't blow up without the relay.
         await page.addInitScript(() => { window.__nektoRelay = { tracks: 0, frames: 0, peers: 0, error: null, peerStates: [], iceStates: [], inboundPackets: 0, inboundBytes: 0, trackEvents: 0, audioState: 'n/a' }; });
@@ -672,6 +673,15 @@ export class NektoBrowser {
     return { ...status, autoNext: this.autoNext, manualSearch: this.manualSearch, waitingForManualSearch: this.waitingForManualSearch,
       browserIp: this.browserIp, webglRenderer: this.webglRenderer, canvasHash: this.canvasHash, audioHash: this.audioHash, envProbe: this.envProbe, proxy: this.proxy?.server || null,
       protocolDiagnostics: this.protocolDiagnostics, forwarding: this.forwarding, authorization: this.authorization || status.authorization, observedStage: this.observedStage, controlDiagnostics: this.controlDiagnostics, lastFailure: this.lastFailure, authorizationDiagnostics: this.authorizationDiagnostics, callState: this.callState, promptInfo: this.promptInfo, microphone: this.microphone };
+  }
+  // Feed one PCM frame (base64 interleaved stereo int16 @48k) into nekto's
+  // outgoing mic — i.e. the user's Discord voice. No-op unless a page is live
+  // and injectMic was enabled at launch.
+  async injectMic(base64) {
+    const page = this.page;
+    if (!page || page.isClosed() || !this.injectMicEnabled) return false;
+    try { return await page.evaluate(b => (window.__injectMic ? window.__injectMic(b) : false), base64); }
+    catch (_) { return false; }
   }
   async screenshot() {
     const page = this.page;
