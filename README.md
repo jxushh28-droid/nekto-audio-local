@@ -13,17 +13,15 @@
    `NEKTO_AUTH_TOKEN` if you keep your token in the env).
 4. Double-click **`run.bat`** — or run `npm run start:local` in a terminal.
 5. Open the control panel at **http://localhost:3000**.
-6. In Discord: join a voice channel, set both tokens with `/token1 <token>` and
-   `/token2 <token>`, then `/join`.
+6. In Discord: join a voice channel, set your token with `/token <token>`, then `/join`.
 
-## Two-window bridge
+## 1-on-1 relay
 
-This local build opens **two** nekto windows at once and bridges them: each
-window's stranger is fed the *other* stranger's voice as its microphone, so the
-two strangers hear and talk to each other, while you hear **both** mixed into
-Discord. Your Discord mic is never sent to nekto, so neither stranger hears you.
-Solve each window's captcha in its own live view at `http://localhost:3000`
-(two side-by-side panels, each click-to-interact).
+The bot joins your Discord voice channel, opens one nekto window, searches for a
+stranger, and plays that stranger's audio into your voice channel. Your Discord
+mic is never forwarded to nekto (it sends a silent track), so this is listen-only
+from the stranger's side. Solve a captcha if it appears in the live view at
+`http://localhost:3000` (click-to-interact).
 
 **Leave all the spoof flags unset locally** (`NEKTO_SPOOF_WIN`, `NEKTO_SPOOF_GL`,
 `NEKTO_TZ`, `NEKTO_BROWSER_CHANNEL`, `NEKTO_HEADLESS`). On a real Windows PC the
@@ -50,15 +48,14 @@ This is an **incoming-only** relay. Nekto receives a silent microphone; your Dis
 
 | Command | Action |
 | --- | --- |
-| `/token1 token:<value>` | Save the Nekto token for window 1 (stranger A). |
-| `/token2 token:<value>` | Save the Nekto token for window 2 (stranger B). |
+| `/token token:<value>` | Save or replace your Nekto auth token; restart search if you are in the bot's voice channel. |
 | `/join` | Join your current regular voice channel and search on Nekto. Repeating it keeps an active partner or search. |
 | `/next` | Confirm the ordinary End prompt, acknowledge a partner-left notice, and search again in the same session. An active search is left running. |
 | `/stop` | Close Nekto while remaining in Discord voice. |
 | `/leave` | Close Nekto and leave Discord voice. |
 | `/status` | Show your full saved Nekto token, partner/search state, WebRTC diagnostics, and the last failure privately. |
 
-Set both tokens with `/token1` and `/token2`, join a voice channel yourself, then use `/join` to open both windows. Changing a token restarts that window's search when you are in the bot's voice channel. Replies are ephemeral. `/status` shows the complete saved Nekto token only to the authorized requester; long tokens are attached in `nekto-token.txt` to fit Discord message limits. The bot never logs token values. Only the Discord application owner can control it unless `BOT_OWNER_IDS` is configured. The bot disconnects when the controlling user leaves or moves out of its voice channel.
+Set your token with `/token`, join a voice channel yourself, then use `/join`. Changing the token restarts search when you are in the bot's voice channel. Replies are ephemeral. `/status` shows the complete saved Nekto token only to the authorized requester; long tokens are attached in `nekto-token.txt` to fit Discord message limits. The bot never logs token values. Only the Discord application owner can control it unless `BOT_OWNER_IDS` is configured. The bot disconnects when the controlling user leaves or moves out of its voice channel.
 
 Token acceptance is preserved in status even after a failed browser closes. Native CAPTCHA and hCaptcha flags are refreshed at the failure boundary and whenever live status is requested. `before-start` means the check appeared before clicking Start; `after-start` means it was observed after that click. Runtime logs record these stages and boolean flags without tokens. This locates the failure; it does not establish why the website requested verification.
 

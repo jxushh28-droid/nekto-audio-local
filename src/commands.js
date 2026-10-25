@@ -1,13 +1,10 @@
 import { SlashCommandBuilder } from 'discord.js';
 
 export const commands = [
-  new SlashCommandBuilder().setName('token1').setDescription('Save the Nekto auth token for window 1 (stranger A)')
-    .addStringOption(option => option.setName('token').setDescription('Nekto auth token for window 1')
+  new SlashCommandBuilder().setName('token').setDescription('Save your Nekto auth token privately')
+    .addStringOption(option => option.setName('token').setDescription('Your Nekto auth token')
       .setRequired(true).setMinLength(1).setMaxLength(4000)),
-  new SlashCommandBuilder().setName('token2').setDescription('Save the Nekto auth token for window 2 (stranger B)')
-    .addStringOption(option => option.setName('token').setDescription('Nekto auth token for window 2')
-      .setRequired(true).setMinLength(1).setMaxLength(4000)),
-  new SlashCommandBuilder().setName('join').setDescription('Join your voice channel; open both windows and bridge the two strangers'),
+  new SlashCommandBuilder().setName('join').setDescription('Join your voice channel and search on Nekto'),
   new SlashCommandBuilder().setName('next').setDescription('End this Nekto call and search for another person'),
   new SlashCommandBuilder().setName('autonext').setDescription('Toggle searching after a partner ends the call')
     .addBooleanOption(option => option.setName('enabled').setDescription('Enable or disable automatic next')),

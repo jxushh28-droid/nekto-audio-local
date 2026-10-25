@@ -1,44 +1,8 @@
 // Serialized by Playwright and run before the site's scripts.
-// injectMic: when true, nekto's outgoing microphone is driven by audio pushed
-// from Node via window.__injectMic (used to feed the OTHER stranger's voice in
-// the two-window bridge). getUserMedia is Proxy-overridden (native-code-safe)
-// to return our injected stream instead of the fake capture device.
-export function installBrowserRelay({ origin, injectMic = false }) {
+export function installBrowserRelay({ origin }) {
   if (location.origin !== origin) return;
   const audio = new AudioContext({ sampleRate: 48000 });
   const mix = audio.createGain();
-  // Outgoing-mic injection plumbing (only wired when injectMic is set).
-  const micDest = injectMic ? audio.createMediaStreamDestination() : null;
-  let micNode = null;
-  window.__injectMic = (b64) => {
-    if (!micNode) return false;
-    try {
-      const bin = atob(b64); const len = bin.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-      const view = new DataView(bytes.buffer);
-      const samples = (len / 4) | 0; // interleaved stereo int16 → 4 bytes per frame
-      const left = new Float32Array(samples), right = new Float32Array(samples);
-      for (let i = 0; i < samples; i++) { left[i] = view.getInt16(i * 4, true) / 32768; right[i] = view.getInt16(i * 4 + 2, true) / 32768; }
-      micNode.port.postMessage({ left, right }, [left.buffer, right.buffer]);
-      return true;
-    } catch { return false; }
-  };
-  if (injectMic && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    // Proxy keeps Function.prototype.toString === "[native code]" so nekto's
-    // native-code tamper check passes. Audio requests get our injected stream;
-    // anything else is forwarded to the real getUserMedia untouched.
-    const handler = {
-      apply(target, thisArg, args) {
-        const c = args[0] || {};
-        if (c.audio && micDest) {
-          return Promise.resolve(new MediaStream(micDest.stream.getAudioTracks()));
-        }
-        return Reflect.apply(target, thisArg, args);
-      },
-    };
-    try { navigator.mediaDevices.getUserMedia = new Proxy(navigator.mediaDevices.getUserMedia, handler); } catch {}
-  }
   const tracks = new Map();
   const peers = new Set();
   const pendingTracks = new Set();
@@ -79,28 +43,7 @@ export function installBrowserRelay({ origin, injectMic = false }) {
         return true;
       }
     }
-    registerProcessor('nekto-relay', Relay);
-    class Mic extends AudioWorkletProcessor {
-      constructor() { super(); this.q = []; this.qLen = 0;
-        this.port.onmessage = (e) => { const d = e.data; d.off = 0; this.q.push(d); this.qLen += d.left.length; }; }
-      process(_inputs, outputs) {
-        const out = outputs[0]; if (!out || !out[0]) return true;
-        const L = out[0]; const R = out[1] || null;
-        let i = 0;
-        while (i < L.length) {
-          if (!this.q.length) { for (; i < L.length; i++) { L[i] = 0; if (R) R[i] = 0; } break; }
-          const h = this.q[0]; const avail = h.left.length - h.off; const need = L.length - i;
-          const n = avail < need ? avail : need;
-          for (let k = 0; k < n; k++) { L[i + k] = h.left[h.off + k]; if (R) R[i + k] = h.right ? h.right[h.off + k] : h.left[h.off + k]; }
-          h.off += n; i += n; this.qLen -= n;
-          if (h.off >= h.left.length) this.q.shift();
-        }
-        // Cap buffered audio to ~1s so the bridge stays low-latency on overrun.
-        while (this.qLen > sampleRate) { const h = this.q.shift(); if (!h) break; this.qLen -= (h.left.length - h.off); }
-        return true;
-      }
-    }
-    registerProcessor('nekto-mic', Mic);`;
+    registerProcessor('nekto-relay', Relay);`;
   const ready = (async () => {
     const url = URL.createObjectURL(new Blob([processorCode], { type: 'application/javascript' }));
     try { await audio.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
@@ -110,10 +53,6 @@ export function installBrowserRelay({ origin, injectMic = false }) {
     processor.port.onmessage = ({ data }) => send(data);
     mix.connect(processor);
     processor.connect(audio.destination); // Worklet output is silence; keeps the graph rendering.
-    if (injectMic && micDest) {
-      micNode = new AudioWorkletNode(audio, 'nekto-mic', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
-      micNode.connect(micDest);
-    }
     await audio.resume();
   })();
   ready.catch(() => { window.__nektoRelay.error = 'Audio capture initialization failed.'; });
