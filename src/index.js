@@ -351,6 +351,13 @@ const server = http.createServer(async (request, response) => {
   // cache-buster), so a strict request.url === '/screenshot' never matched and
   // fell through to 404 — which blanked the live view.
   const pathname = (request.url || '').split('?')[0];
+  if (pathname === '/healthz') {
+    // Liveness: the process is up and serving. Used by the Railway healthcheck,
+    // which must pass before Discord login finishes (that takes ~30s).
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
   if (pathname === '/health') {
     response.writeHead(ready && client.isReady() ? 200 : 503, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ ready: ready && client.isReady() }));
